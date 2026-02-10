@@ -1,0 +1,27 @@
+# ===== Secrets =====
+.env
+.env.*
+!.env.example
+
+# ===== Node / Next.js =====
+node_modules/
+.next/
+dist/
+out/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== Audio =====
+uploads/
+*.wav
+*.mp3
+*.m4a
+
+# ===== IDE =====
+.vscode/
+.idea/
+.DS_Store
