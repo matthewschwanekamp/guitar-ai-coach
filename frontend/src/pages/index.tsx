@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
+import Waveform from "../components/Waveform";
 
 type ValidationStatus = "idle" | "validating" | "valid" | "invalid";
 type InputMode = "upload" | "record";
@@ -101,6 +102,12 @@ export default function HomePage() {
   const autoStopTimeoutRef = useRef<number | null>(null);
   const stopSafetyTimeoutRef = useRef<number | null>(null);
   const stopHandledRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafIdRef = useRef<number | null>(null);
+
+  const [level, setLevel] = useState<number>(0);
+  const [clippingRisk, setClippingRisk] = useState<boolean>(false);
   const [recordingMimeType, setRecordingMimeType] = useState<string | null>(null);
 
   // Audio preview URL is separate from metadata URL. We keep this one alive while previewing.
@@ -129,6 +136,26 @@ export default function HomePage() {
     }
   }, []);
 
+  const stopLevelMonitoring = useCallback(() => {
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+
+    if (analyserRef.current) {
+      analyserRef.current.disconnect();
+      analyserRef.current = null;
+    }
+
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => undefined);
+      audioCtxRef.current = null;
+    }
+
+    setLevel(0);
+    setClippingRisk(false);
+  }, []);
+
   const stopStream = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
@@ -143,6 +170,7 @@ export default function HomePage() {
       stopTimer();
       clearAutoStopTimeout();
       clearStopSafetyTimeout();
+      stopLevelMonitoring();
       stopStream();
       chunksRef.current = [];
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
@@ -156,12 +184,13 @@ export default function HomePage() {
         }
       }
     };
-  }, [previewUrl, stopStream, stopTimer, clearAutoStopTimeout, clearStopSafetyTimeout]);
+  }, [previewUrl, stopStream, stopTimer, clearAutoStopTimeout, clearStopSafetyTimeout, stopLevelMonitoring]);
 
   const resetRecording = () => {
     stopTimer();
     clearAutoStopTimeout();
     clearStopSafetyTimeout();
+    stopLevelMonitoring();
     stopStream();
     chunksRef.current = [];
     setElapsedSeconds(0);
@@ -282,6 +311,8 @@ export default function HomePage() {
 
   const handleModeChange = (nextMode: InputMode) => {
     if (recordingState !== "idle") return;
+    // Clear any current audio/preview when switching modes to avoid stale state.
+    reset();
     setMode(nextMode);
   };
 
@@ -322,6 +353,39 @@ export default function HomePage() {
       recordingStartMsRef.current = Number(new Date());
       setElapsedSeconds(0);
       setRecordingState("recording");
+      setLevel(0);
+      setClippingRisk(false);
+
+      // Set up live level monitoring
+      try {
+        const audioCtx = new AudioContext();
+        const sourceNode = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        sourceNode.connect(analyser);
+
+        const data = new Uint8Array(analyser.fftSize);
+
+        const tick = () => {
+          analyser.getByteTimeDomainData(data);
+          let peak = 0;
+          for (let i = 0; i < data.length; i += 1) {
+            // data is centered at 128; convert to -1..1
+            const sample = Math.abs(data[i] - 128) / 128;
+            if (sample > peak) peak = sample;
+          }
+          setLevel(peak);
+          setClippingRisk(peak > 0.92);
+          rafIdRef.current = requestAnimationFrame(tick);
+        };
+
+        rafIdRef.current = requestAnimationFrame(tick);
+
+        audioCtxRef.current = audioCtx;
+        analyserRef.current = analyser;
+      } catch {
+        // Monitoring is non-critical; ignore failures.
+      }
 
       recorder.ondataavailable = (event: BlobEvent) => {
         if (event.data && event.data.size > 0) {
@@ -342,6 +406,7 @@ export default function HomePage() {
         stopTimer();
         clearAutoStopTimeout();
         clearStopSafetyTimeout();
+        stopLevelMonitoring();
         stopStream();
 
         if (chunksRef.current.length === 0) {
@@ -413,6 +478,7 @@ export default function HomePage() {
     stopTimer();
     clearAutoStopTimeout();
     clearStopSafetyTimeout();
+    stopLevelMonitoring();
 
     if (reason === "auto") {
       setElapsedSeconds(MAX_SECONDS);
@@ -555,6 +621,34 @@ export default function HomePage() {
                 </div>
               )}
             </div>
+            {isRecording && (
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>Input level</div>
+                <div
+                  style={{
+                    position: "relative",
+                    height: 10,
+                    background: "#f0f0f0",
+                    borderRadius: 6,
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    style={{
+                      height: "100%",
+                      width: `${Math.min(100, Math.round(level * 100))}%`,
+                      background: clippingRisk ? "#c0392b" : "#2c7be5",
+                      transition: "width 80ms linear",
+                    }}
+                  />
+                </div>
+                {clippingRisk && (
+                  <div style={{ marginTop: 6, color: "#c0392b", fontSize: 13 }}>
+                    Clipping risk — move farther from mic / lower input volume.
+                  </div>
+                )}
+              </div>
+            )}
             <div style={{ marginTop: 8, color: "#555", fontSize: 14 }}>
               Tip: click Start to grant microphone permission, then Stop to review your take.
             </div>
@@ -583,7 +677,7 @@ export default function HomePage() {
         {previewUrl && status === "valid" && (
           <div style={{ marginTop: 16 }}>
             <label style={{ display: "block", fontWeight: 600, marginBottom: 8 }}>Preview</label>
-            <audio controls src={previewUrl} style={{ width: "100%" }} />
+            <Waveform audioUrl={previewUrl} />
           </div>
         )}
 
