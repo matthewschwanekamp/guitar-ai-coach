@@ -1,5 +1,11 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Waveform from "../components/Waveform";
+import { analyzeAudio, coachFromMetrics } from "../services/api";
+import { CoachResponse, Metrics } from "../types";
+import SummaryCard from "../components/SummaryCard";
+import PracticePlan from "../components/PracticePlan";
+import { copyToClipboard } from "../utils/copyToClipboard";
+import { formatCoachReport } from "../utils/formatReport";
 
 type ValidationStatus = "idle" | "validating" | "valid" | "invalid";
 type InputMode = "upload" | "record";
@@ -109,6 +115,17 @@ export default function HomePage() {
   const [level, setLevel] = useState<number>(0);
   const [clippingRisk, setClippingRisk] = useState<boolean>(false);
   const [recordingMimeType, setRecordingMimeType] = useState<string | null>(null);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [analyzeResult, setAnalyzeResult] = useState<Metrics | null>(null);
+  const [plan, setPlan] = useState<CoachResponse | null>(null);
+  const [isCoaching, setIsCoaching] = useState(false);
+  const [coachError, setCoachError] = useState<string | null>(null);
+  const [skillLevel, setSkillLevel] = useState<string>("beginner");
+  const [goal, setGoal] = useState<string>("Improve timing consistency and clean dynamics.");
+  const [copyStatus, setCopyStatus] = useState<"idle" | "success" | "error">("idle");
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const [metricsOpen, setMetricsOpen] = useState(false);
 
   // Audio preview URL is separate from metadata URL. We keep this one alive while previewing.
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -222,6 +239,14 @@ export default function HomePage() {
     setError(null);
     setFile(null);
     setDurationSeconds(null);
+    setAnalyzeError(null);
+    setAnalyzeResult(null);
+    setIsAnalyzing(false);
+    setPlan(null);
+    setCoachError(null);
+    setIsCoaching(false);
+    setCopyStatus("idle");
+    setCopyError(null);
 
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
@@ -693,18 +718,184 @@ export default function HomePage() {
           <button
             type="button"
             disabled={!canProceed}
-            onClick={() => console.log("Ready to send to backend:", { file, durationSeconds })}
+            onClick={async () => {
+              if (!file) return;
+              setAnalyzeError(null);
+              setAnalyzeResult(null);
+              setIsAnalyzing(true);
+              try {
+                const res = await analyzeAudio(file);
+                setAnalyzeResult(res);
+                setPlan(null);
+                setCoachError(null);
+                console.log("Analyze response:", res);
+              } catch (err: any) {
+                const message = err?.message || "Analyze failed";
+                setAnalyzeError(message);
+                console.error("Analyze error:", err);
+              } finally {
+                setIsAnalyzing(false);
+              }
+            }}
             style={{
               padding: "10px 14px",
               borderRadius: 10,
               border: "1px solid #222",
-              background: canProceed ? "#222" : "#aaa",
+              background: canProceed && !isAnalyzing ? "#222" : "#aaa",
               color: "white",
-              cursor: canProceed ? "pointer" : "not-allowed",
+              cursor: canProceed && !isAnalyzing ? "pointer" : "not-allowed",
             }}
           >
-            Analyze my playing (next step)
+            {isAnalyzing ? "Analyzing…" : "Analyze my playing (next step)"}
           </button>
+        </div>
+
+        {analyzeError && (
+          <div style={{ marginTop: 12, padding: 12, borderRadius: 10, background: "#fff3f3", border: "1px solid #ffd0d0", color: "#8a1f1f" }}>
+            <strong>Analyze error:</strong> {analyzeError}
+          </div>
+        )}
+
+        {analyzeResult && (
+          <div style={{ marginTop: 12, border: "1px solid #e5e5e5", borderRadius: 10, padding: 12, background: "white" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 600 }}>Backend metrics JSON</div>
+              <button
+                type="button"
+                onClick={() => setMetricsOpen((v) => !v)}
+                aria-expanded={metricsOpen}
+                aria-controls="metrics-json-panel"
+                disabled={!analyzeResult}
+                style={{
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: "1px solid #777",
+                  background: "white",
+                  color: "#222",
+                  cursor: "pointer",
+                  fontSize: 13,
+                }}
+              >
+                {metricsOpen ? "Hide JSON" : "Show JSON"}
+              </button>
+            </div>
+            {metricsOpen && (
+              <div id="metrics-json-panel" style={{ marginTop: 8 }}>
+                <pre style={{ background: "#f6f6f6", padding: 12, borderRadius: 10, maxHeight: 320, overflow: "auto", border: "1px solid #e5e5e5", margin: 0 }}>
+{JSON.stringify(analyzeResult, null, 2)}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{ marginTop: 16, padding: 12, borderRadius: 10, border: "1px solid #e5e5e5", background: "#f8f8f8" }}>
+          <h3 style={{ marginTop: 0 }}>Generate Plan</h3>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+            <label>
+              Skill level:{" "}
+              <select value={skillLevel} onChange={(e) => setSkillLevel(e.target.value)}>
+                <option value="beginner">beginner</option>
+                <option value="intermediate">intermediate</option>
+                <option value="advanced">advanced</option>
+              </select>
+            </label>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", flex: 1 }}>
+              <label style={{ flex: "1 1 360px", minWidth: 240 }}>
+                Goal:{" "}
+                <input
+                  type="text"
+                  value={goal}
+                  onChange={(e) => setGoal(e.target.value)}
+                  style={{ width: "100%", padding: 8 }}
+                  placeholder="What do you want to improve?"
+                />
+              </label>
+              <button
+                type="button"
+                disabled={!analyzeResult || isCoaching || isAnalyzing}
+                onClick={async () => {
+                  if (!analyzeResult) return;
+                  setIsCoaching(true);
+                  setCoachError(null);
+                  setPlan(null);
+                  try {
+                    const resp = await coachFromMetrics({
+                      metrics: analyzeResult,
+                      skill_level: skillLevel,
+                      goal,
+                    });
+                    setPlan(resp);
+                    console.log("Coach response:", resp);
+                  } catch (err: any) {
+                    const message = err?.message || "Coach failed";
+                    setCoachError(message);
+                    console.error(err);
+                  } finally {
+                    setIsCoaching(false);
+                  }
+                }}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid #222",
+                  background: analyzeResult && !isCoaching && !isAnalyzing ? "#222" : "#aaa",
+                  color: "white",
+                  cursor: analyzeResult && !isCoaching && !isAnalyzing ? "pointer" : "not-allowed",
+                  flex: "0 0 auto",
+                }}
+              >
+                {isCoaching ? "Generating…" : "Generate Plan"}
+              </button>
+            </div>
+          </div>
+          {isCoaching && <div style={{ marginTop: 8 }}>Calling /coach…</div>}
+          {coachError && (
+            <div style={{ marginTop: 10, padding: 10, borderRadius: 8, background: "#fff3f3", border: "1px solid #ffd0d0", color: "#8a1f1f" }}>
+              <strong>Coach error:</strong> {coachError}
+            </div>
+          )}
+          {plan && (
+            <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 700 }}>Results</div>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!plan) return;
+                    try {
+                      setCopyError(null);
+                      setCopyStatus("idle");
+                      const text = formatCoachReport(plan);
+                      await copyToClipboard(text);
+                      setCopyStatus("success");
+                      setTimeout(() => setCopyStatus("idle"), 1500);
+                    } catch (err: any) {
+                      setCopyStatus("error");
+                      setCopyError(err?.message || "Copy failed");
+                    }
+                  }}
+                  style={{
+                    padding: "6px 10px",
+                    borderRadius: 8,
+                    border: "1px solid #777",
+                    background: "white",
+                    color: "#222",
+                    cursor: "pointer",
+                    fontSize: 13,
+                  }}
+                  disabled={!plan}
+                >
+                  {copyStatus === "success" ? "Copied!" : "Copy report"}
+                </button>
+              </div>
+              {copyStatus === "error" && copyError && (
+                <div style={{ fontSize: 12, color: "#b00020" }}>{copyError}</div>
+              )}
+              <SummaryCard summary={plan.summary} />
+              <PracticePlan drills={plan.drills} totalMinutes={plan.total_minutes} />
+            </div>
+          )}
         </div>
       </section>
 
