@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import Waveform from "../components/Waveform";
 import { analyzeAudio, coachFromMetrics } from "../services/api";
-import { CoachResponse, Metrics } from "../types";
+import { ApiError, CoachResponse, Metrics, RuleRecommendation } from "../types";
 import SummaryCard from "../components/SummaryCard";
 import PracticePlan from "../components/PracticePlan";
 import { copyToClipboard } from "../utils/copyToClipboard";
 import { formatCoachReport } from "../utils/formatReport";
+import ErrorBanner, { DisplayError } from "../components/ErrorBanner";
 
 type ValidationStatus = "idle" | "validating" | "valid" | "invalid";
 type InputMode = "upload" | "record";
@@ -116,16 +117,18 @@ export default function HomePage() {
   const [clippingRisk, setClippingRisk] = useState<boolean>(false);
   const [recordingMimeType, setRecordingMimeType] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analyzeError, setAnalyzeError] = useState<string | null>(null);
+  const [analyzeError, setAnalyzeError] = useState<DisplayError | null>(null);
   const [analyzeResult, setAnalyzeResult] = useState<Metrics | null>(null);
+  const [ruleRecs, setRuleRecs] = useState<RuleRecommendation[]>([]);
   const [plan, setPlan] = useState<CoachResponse | null>(null);
   const [isCoaching, setIsCoaching] = useState(false);
-  const [coachError, setCoachError] = useState<string | null>(null);
+  const [coachError, setCoachError] = useState<DisplayError | null>(null);
   const [skillLevel, setSkillLevel] = useState<string>("beginner");
-  const [goal, setGoal] = useState<string>("Improve timing consistency and clean dynamics.");
+  const [goal, setGoal] = useState<string>("Improve timing consistency");
   const [copyStatus, setCopyStatus] = useState<"idle" | "success" | "error">("idle");
   const [copyError, setCopyError] = useState<string | null>(null);
   const [metricsOpen, setMetricsOpen] = useState(false);
+  const [ruleRecsOpen, setRuleRecsOpen] = useState(false);
 
   // Audio preview URL is separate from metadata URL. We keep this one alive while previewing.
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
@@ -241,12 +244,14 @@ export default function HomePage() {
     setDurationSeconds(null);
     setAnalyzeError(null);
     setAnalyzeResult(null);
+    setRuleRecs([]);
     setIsAnalyzing(false);
     setPlan(null);
     setCoachError(null);
     setIsCoaching(false);
     setCopyStatus("idle");
     setCopyError(null);
+    setRuleRecsOpen(false);
 
     if (previewUrl) {
       URL.revokeObjectURL(previewUrl);
@@ -722,16 +727,27 @@ export default function HomePage() {
               if (!file) return;
               setAnalyzeError(null);
               setAnalyzeResult(null);
+              setRuleRecs([]);
               setIsAnalyzing(true);
               try {
                 const res = await analyzeAudio(file);
-                setAnalyzeResult(res);
+                setAnalyzeResult(res.metrics);
+                setRuleRecs(res.rule_recommendations || []);
                 setPlan(null);
                 setCoachError(null);
                 console.log("Analyze response:", res);
               } catch (err: any) {
-                const message = err?.message || "Analyze failed";
-                setAnalyzeError(message);
+                const apiErr = (err as any)?.apiError as ApiError | undefined;
+                if (apiErr) {
+                  setAnalyzeError({
+                    user_message: apiErr.user_message || "Analyze failed",
+                    how_to_fix: apiErr.how_to_fix,
+                    error_code: apiErr.error_code,
+                  });
+                } else {
+                  const message = err?.message || "Analyze failed";
+                  setAnalyzeError({ user_message: message });
+                }
                 console.error("Analyze error:", err);
               } finally {
                 setIsAnalyzing(false);
@@ -746,15 +762,11 @@ export default function HomePage() {
               cursor: canProceed && !isAnalyzing ? "pointer" : "not-allowed",
             }}
           >
-            {isAnalyzing ? "Analyzing…" : "Analyze my playing (next step)"}
+            {isAnalyzing ? "Analyzing…" : "Analyze my playing"}
           </button>
         </div>
 
-        {analyzeError && (
-          <div style={{ marginTop: 12, padding: 12, borderRadius: 10, background: "#fff3f3", border: "1px solid #ffd0d0", color: "#8a1f1f" }}>
-            <strong>Analyze error:</strong> {analyzeError}
-          </div>
-        )}
+        {analyzeError && <ErrorBanner error={analyzeError} />}
 
         {analyzeResult && (
           <div style={{ marginTop: 12, border: "1px solid #e5e5e5", borderRadius: 10, padding: 12, background: "white" }}>
@@ -789,72 +801,155 @@ export default function HomePage() {
           </div>
         )}
 
-        <div style={{ marginTop: 16, padding: 12, borderRadius: 10, border: "1px solid #e5e5e5", background: "#f8f8f8" }}>
-          <h3 style={{ marginTop: 0 }}>Generate Plan</h3>
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-            <label>
-              Skill level:{" "}
-              <select value={skillLevel} onChange={(e) => setSkillLevel(e.target.value)}>
-                <option value="beginner">beginner</option>
-                <option value="intermediate">intermediate</option>
-                <option value="advanced">advanced</option>
-              </select>
-            </label>
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center", flex: 1 }}>
-              <label style={{ flex: "1 1 360px", minWidth: 240 }}>
-                Goal:{" "}
-                <input
-                  type="text"
-                  value={goal}
-                  onChange={(e) => setGoal(e.target.value)}
-                  style={{ width: "100%", padding: 8 }}
-                  placeholder="What do you want to improve?"
-                />
-              </label>
+        {ruleRecs.length > 0 && (
+          <div style={{ marginTop: 16, border: "1px solid #e5e5e5", borderRadius: 10, padding: 12, background: "white" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontWeight: 700 }}>What you should work on</div>
               <button
                 type="button"
-                disabled={!analyzeResult || isCoaching || isAnalyzing}
-                onClick={async () => {
-                  if (!analyzeResult) return;
-                  setIsCoaching(true);
-                  setCoachError(null);
-                  setPlan(null);
-                  try {
-                    const resp = await coachFromMetrics({
-                      metrics: analyzeResult,
-                      skill_level: skillLevel,
-                      goal,
-                    });
-                    setPlan(resp);
-                    console.log("Coach response:", resp);
-                  } catch (err: any) {
-                    const message = err?.message || "Coach failed";
-                    setCoachError(message);
-                    console.error(err);
-                  } finally {
-                    setIsCoaching(false);
-                  }
-                }}
+                onClick={() => setRuleRecsOpen((v) => !v)}
+                aria-expanded={ruleRecsOpen}
+                aria-controls="rule-recs-panel"
                 style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid #222",
-                  background: analyzeResult && !isCoaching && !isAnalyzing ? "#222" : "#aaa",
-                  color: "white",
-                  cursor: analyzeResult && !isCoaching && !isAnalyzing ? "pointer" : "not-allowed",
-                  flex: "0 0 auto",
+                  padding: "6px 10px",
+                  borderRadius: 8,
+                  border: "1px solid #777",
+                  background: "white",
+                  color: "#222",
+                  cursor: "pointer",
+                  fontSize: 13,
                 }}
               >
-                {isCoaching ? "Generating…" : "Generate Plan"}
+                {ruleRecsOpen ? "Hide" : "Show"}
               </button>
             </div>
+            {ruleRecsOpen && (
+              <div id="rule-recs-panel" style={{ marginTop: 8, display: "flex", flexDirection: "column", gap: 10 }}>
+                {ruleRecs.map((rec, idx) => {
+                  const badgeColor =
+                    rec.urgency === "high" ? "#b91c1c" : rec.urgency === "medium" ? "#d97706" : "#059669";
+                  const badgeBg =
+                    rec.urgency === "high" ? "#fee2e2" : rec.urgency === "medium" ? "#fef3c7" : "#ecfdf3";
+                  return (
+                    <div key={`${rec.category}-${idx}`} style={{ border: "1px solid #eee", borderRadius: 10, padding: 10 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                        <div style={{ fontWeight: 600 }}>{rec.category}</div>
+                        <span
+                          style={{
+                            padding: "2px 8px",
+                            borderRadius: 999,
+                            background: badgeBg,
+                            color: badgeColor,
+                            fontSize: 12,
+                            border: `1px solid ${badgeColor}`,
+                          }}
+                        >
+                          {rec.urgency.toUpperCase()}
+                        </span>
+                      </div>
+                      <div style={{ marginTop: 6, color: "#444", fontSize: 14 }}>{rec.reason}</div>
+                      {rec.evidence?.length > 0 && (
+                        <ul style={{ marginTop: 6, marginBottom: 0, paddingLeft: 18, color: "#555" }}>
+                          {rec.evidence.slice(0, 3).map((ev, i) => (
+                            <li key={i} style={{ marginBottom: 2 }}>
+                              {ev}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{ marginTop: 16, padding: 12, borderRadius: 10, border: "1px solid #e5e5e5", background: "#f8f8f8" }}>
+          <h3 style={{ marginTop: 0 }}>Generate Plan</h3>
+          <div style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%", maxWidth: 640 }}>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-end", width: "100%" }}>
+              <div style={{ width: 180, minWidth: 160 }}>
+                <label style={{ display: "block", marginBottom: 6 }}>
+                  Skill level:
+                </label>
+                <select
+                  value={skillLevel}
+                  onChange={(e) => setSkillLevel(e.target.value)}
+                  style={{ width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                >
+                  <option value="beginner">beginner</option>
+                  <option value="intermediate">intermediate</option>
+                  <option value="advanced">advanced</option>
+                </select>
+              </div>
+
+              <div style={{ flex: 1, minWidth: 240 }}>
+                <label style={{ display: "block", marginBottom: 6 }}>
+                  Goal:
+                </label>
+                <select
+                  value={goal}
+                  onChange={(e) => setGoal(e.target.value)}
+                  style={{ width: "100%", padding: 8, borderRadius: 6, border: "1px solid #ccc" }}
+                >
+                  <option value="Improve timing consistency">Improve timing consistency</option>
+                  <option value="Clean up volume control">Clean up volume control</option>
+                  <option value="Stop rushing and dragging">Stop rushing and dragging</option>
+                  <option value="Build overall consistency">Build overall consistency</option>
+                  <option value="Play cleanly at higher tempo">Play cleanly at higher tempo</option>
+                </select>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={!analyzeResult || isCoaching || isAnalyzing}
+              onClick={async () => {
+                if (!analyzeResult) return;
+                setIsCoaching(true);
+                setCoachError(null);
+                setPlan(null);
+                try {
+                  const resp = await coachFromMetrics({
+                    metrics: analyzeResult,
+                    skill_level: skillLevel,
+                    goal,
+                  });
+                  setPlan(resp);
+                  console.log("Coach response:", resp);
+                } catch (err: any) {
+                  const apiErr = (err as any)?.apiError as ApiError | undefined;
+                  if (apiErr) {
+                    setCoachError({
+                      user_message: apiErr.user_message || "Coach failed",
+                      how_to_fix: apiErr.how_to_fix,
+                      error_code: apiErr.error_code,
+                    });
+                  } else {
+                    const message = err?.message || "Coach failed";
+                    setCoachError({ user_message: message });
+                  }
+                  console.error(err);
+                } finally {
+                  setIsCoaching(false);
+                }
+              }}
+              style={{
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid #222",
+                background: analyzeResult && !isCoaching && !isAnalyzing ? "#222" : "#aaa",
+                color: "white",
+                cursor: analyzeResult && !isCoaching && !isAnalyzing ? "pointer" : "not-allowed",
+                width: "100%",
+              }}
+            >
+              {isCoaching ? "Generating…" : "Generate Plan"}
+            </button>
           </div>
           {isCoaching && <div style={{ marginTop: 8 }}>Calling /coach…</div>}
-          {coachError && (
-            <div style={{ marginTop: 10, padding: 10, borderRadius: 8, background: "#fff3f3", border: "1px solid #ffd0d0", color: "#8a1f1f" }}>
-              <strong>Coach error:</strong> {coachError}
-            </div>
-          )}
+          {coachError && <ErrorBanner error={coachError} />}
           {plan && (
             <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 12 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>

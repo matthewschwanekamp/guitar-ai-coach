@@ -3,6 +3,8 @@ import librosa
 import logging
 from fastapi import HTTPException, status
 
+from app.error_responses import raise_error
+
 MIN_SECONDS = 15
 MAX_SECONDS = 90
 SR = 44100
@@ -62,18 +64,56 @@ def analyze_wav_file(path: str) -> dict:
     try:
         y, sr = librosa.load(path, sr=SR, mono=True)
     except FileNotFoundError:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Converted audio not found.")
+        raise_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Converted audio not found.",
+            ["Retry the upload; if it persists, contact support."],
+        )
     except Exception as exc:  # pragma: no cover - defensive
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Could not read audio: {exc}")
+        raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            "UNSUPPORTED_FORMAT",
+            "Could not read the uploaded audio.",
+            ["Re-export the file as WAV or MP3.", "Ensure the file is not DRM-protected."],
+            details={"message": str(exc)},
+        )
 
     if y.size == 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty audio data.")
+        raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            "AUDIO_TOO_SHORT",
+            "The uploaded file contains no audio.",
+            ["Record at least 15 seconds of playing with clear notes."],
+        )
 
     duration = librosa.get_duration(y=y, sr=sr)
     if duration < MIN_SECONDS or duration > MAX_SECONDS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Audio duration must be between 15 and 90 seconds.",
+        if duration < MIN_SECONDS:
+            raise_error(
+                status.HTTP_400_BAD_REQUEST,
+                "AUDIO_TOO_SHORT",
+                f"Audio duration is too short ({duration:.1f}s). Minimum is {MIN_SECONDS}s.",
+                ["Record at least 15 seconds of playing.", "Include several clear notes with consistent timing."],
+            )
+        raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            "AUDIO_TOO_LONG",
+            f"Audio duration is too long ({duration:.1f}s). Maximum is {MAX_SECONDS}s.",
+            ["Trim the clip to under 90 seconds and retry."],
+        )
+
+    peak = float(np.max(np.abs(y))) if y.size else 0.0
+    if peak < 0.005:
+        raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            "AUDIO_QUALITY_POOR",
+            "The recording is too quiet for reliable analysis.",
+            [
+                "Move closer to the mic or use a direct input.",
+                "Increase your instrument level without clipping.",
+                "Reduce background noise and hum.",
+            ],
         )
 
     # Tempo (kept for display; timing metrics now IOI-based and independent of beat tracking)
@@ -221,9 +261,15 @@ def analyze_wav_file(path: str) -> dict:
         break
 
     if ioi_ms_filt is None or onset_times is None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Not enough distinct note onsets detected for timing analysis. Try a cleaner recording or more percussive playing.",
+        raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            "AUDIO_QUALITY_POOR",
+            "We couldn't detect enough clear note onsets to analyze timing.",
+            [
+                "Play with clearer, more percussive attacks.",
+                "Reduce background noise and room echo.",
+                "Move closer to the mic or use a direct input.",
+            ],
         )
 
     median_ioi = float(np.median(ioi_ms_filt))
@@ -286,7 +332,7 @@ def analyze_wav_file(path: str) -> dict:
     timing_std_norm = min(1.0, timing_variance / 100.0)
     consistency_score = _clamp(0.5 * (1 - timing_std_norm) + 0.5 * volume_consistency)
 
-    return {
+    result = {
         "tempo_bpm": round(float(tempo), 2),
         "timing": {
             "average_offset_ms": round(avg_offset, 2),
@@ -304,3 +350,19 @@ def analyze_wav_file(path: str) -> dict:
             "consistency_score": round(consistency_score, 2),
         },
     }
+
+    # Low dynamic range or extreme noise floors can make results unreliable; flag as quality issues.
+    if dynamic_range < 5.0 or avg_db < -45.0:
+        raise_error(
+            status.HTTP_400_BAD_REQUEST,
+            "AUDIO_QUALITY_POOR",
+            "Recording quality is too poor for reliable feedback (very low dynamics or level).",
+            [
+                "Record closer to the mic or plug in directly.",
+                "Avoid heavy noise reduction/compression that flattens dynamics.",
+                "Aim for a healthy level that does not clip.",
+            ],
+            details={"dynamic_range_db": dynamic_range, "average_db": avg_db},
+        )
+
+    return result

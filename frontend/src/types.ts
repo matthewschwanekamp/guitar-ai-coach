@@ -53,3 +53,18 @@ export interface CoachResponse {
   total_minutes: number;
   disclaimer: string | null;
 }
+
+export interface ApiError {
+  error_code: string;
+  user_message: string;
+  how_to_fix?: string[];
+  debug_id?: string;
+  details?: Record<string, unknown>;
+}
+
+export interface RuleRecommendation {
+  category: "Improve timing and consistency" | "Clean up volume control" | "Stop rushing and dragging" | "Build overall consistency";
+  urgency: "low" | "medium" | "high";
+  reason: string;
+  evidence: string[];
+}

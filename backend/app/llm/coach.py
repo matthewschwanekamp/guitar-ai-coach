@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Literal, Set
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel, Field, field_validator, model_validator
+from app.error_responses import raise_error, build_error_response
+from app.coaching.rules import RuleRecommendation, generate_rule_recommendations
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +69,7 @@ class CoachResponse(BaseModel):
     drills: List[Drill]
     total_minutes: int
     disclaimer: Optional[str] = None
+    rule_recommendations: List[RuleRecommendation] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_drills_and_total(cls, values: "CoachResponse") -> "CoachResponse":
@@ -95,6 +98,7 @@ class CoachRequest(BaseModel):
 
 def call_llm(prompt: str, metrics: Dict[str, Any], provider: Optional[str] = None, schema: Optional[Dict[str, Any]] = None, attempt: int = 1, system_prompt: Optional[str] = None) -> str:
     provider = (provider or os.getenv("LLM_PROVIDER", "mock")).lower()
+    print("[LLM DEBUG] PROVIDER:", provider)
     logger.info("[COACH] provider=%s attempt=%d", provider, attempt)
 
     if provider == "mock":
@@ -192,11 +196,22 @@ def call_llm(prompt: str, metrics: Dict[str, Any], provider: Optional[str] = Non
         try:
             from openai import OpenAI
         except Exception as exc:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OpenAI SDK not installed") from exc
+            raise_error(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "OpenAI SDK is not installed on the server.",
+                ["Install the OpenAI Python SDK and retry."],
+                details={"message": str(exc)},
+            )
 
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="OPENAI_API_KEY not set")
+            raise_error(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "OPENAI_API_KEY is not configured.",
+                ["Set the OPENAI_API_KEY environment variable and try again."],
+            )
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
         client = OpenAI(api_key=api_key)
@@ -220,7 +235,22 @@ def call_llm(prompt: str, metrics: Dict[str, Any], provider: Optional[str] = Non
             )
         except Exception as exc:
             log_coach_failure("provider_call", str(exc))
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="LLM returned invalid output") from exc
+            msg = str(exc)
+            if "timeout" in msg.lower():
+                raise_error(
+                    status.HTTP_504_GATEWAY_TIMEOUT,
+                    "LLM_TIMEOUT",
+                    "The coaching model timed out.",
+                    ["Try again in a few seconds.", "If it keeps failing, retry after re-running analysis."],
+                    details={"message": msg},
+                )
+            raise_error(
+                status.HTTP_502_BAD_GATEWAY,
+                "LLM_INVALID_OUTPUT",
+                "The coaching model returned an invalid response.",
+                ["Try again in a few seconds.", "If it persists, re-run analysis and retry coaching."],
+                details={"message": msg},
+            )
 
         def extract_output(r):
             try:
@@ -236,10 +266,21 @@ def call_llm(prompt: str, metrics: Dict[str, Any], provider: Optional[str] = Non
         raw_out = extract_output(resp)
         if not raw_out:
             log_coach_failure("provider_call", "Could not extract OpenAI response text", None, {})
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="LLM returned invalid output")
+            raise_error(
+                status.HTTP_502_BAD_GATEWAY,
+                "LLM_INVALID_OUTPUT",
+                "The coaching model returned an invalid response.",
+                ["Try again in a few seconds.", "If it persists, re-run analysis and retry coaching."],
+            )
         return raw_out
 
-    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported LLM provider")
+    raise_error(
+        status.HTTP_500_INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+        "Unsupported LLM provider configured.",
+        ["Set LLM_PROVIDER to 'openai' or leave unset for mock."],
+        details={"provider": provider},
+    )
 
 
 # ---------------- Prompting & Guardrails ---------------- #
@@ -438,29 +479,57 @@ def validate_success_criteria(drills: List[Drill], metrics: Dict[str, Any]) -> b
         "dynamic_range_db": float(metrics.get("dynamics", {}).get("dynamic_range_db", 0)),
         "consistency_score": float(metrics.get("trends", {}).get("consistency_score", 0)),
     }
+
+    supported_metrics = set(curr.keys())
+    eps = 1e-6
+
+    def detect_metric(text: str) -> Optional[str]:
+        for name in supported_metrics:
+            if name in text:
+                return name
+        return None
+
+    def parse_target(text: str) -> Optional[float]:
+        # Strip optional (currently ...) clause before extracting the target
+        stripped = re.sub(r"\(currently[^)]*\)", "", text, flags=re.IGNORECASE)
+        nums = NUM_REGEX.findall(stripped)
+        if not nums:
+            return None
+        try:
+            return float(nums[0])
+        except Exception:
+            return None
+
     for drill in drills:
         for crit in drill.success_criteria:
             lower = crit.lower()
-            nums = NUM_REGEX.findall(crit)
-            target = float(nums[0]) if nums else None
-            if "rushed_notes_percent" in lower and target is not None:
-                if target >= curr["rushed_notes_percent"]:
+            metric = detect_metric(lower)
+            if not metric:
+                return False
+
+            target = parse_target(crit)
+            if target is None:
+                return False
+
+            current_val = curr[metric]
+
+            if "increase" in lower:
+                if current_val >= 1.0 - eps:
+                    continue
+                if not (target > current_val):
                     return False
-            if "dragged_notes_percent" in lower and target is not None:
-                if target >= curr["dragged_notes_percent"]:
+            elif "reduce" in lower or "bring" in lower:
+                if current_val <= eps:
+                    if "bring" in lower:
+                        if target > eps:
+                            return False
+                    # If already zero, allow reduce target regardless as there is no improvement possible.
+                    continue
+                if not (target < current_val):
                     return False
-            if "timing_variance_ms" in lower and target is not None:
-                if target >= curr["timing_variance_ms"]:
-                    return False
-            if "volume_consistency_score" in lower and target is not None:
-                if target <= curr["volume_consistency_score"]:
-                    return False
-            if "dynamic_range_db" in lower and target is not None:
-                if target <= curr["dynamic_range_db"]:
-                    return False
-            if "consistency_score" in lower and target is not None:
-                if target <= curr["consistency_score"]:
-                    return False
+            else:
+                # Unknown direction keyword
+                return False
     return True
 
 
@@ -495,20 +564,46 @@ def sanitize_success_criteria(criteria: List[str], metrics: Dict[str, Any]) -> L
         "consistency_score",
     ]
 
+    canonical_by_metric = {
+        "timing_variance_ms": suggestions[0],
+        "rushed_notes_percent": suggestions[1],
+        "dragged_notes_percent": suggestions[2],
+        "volume_consistency_score": suggestions[3],
+        "dynamic_range_db": suggestions[4],
+        "consistency_score": suggestions[5],
+    }
+
+    seen_metrics: Set[str] = set()
+
+    def next_suggestion() -> Optional[str]:
+        for key in allowed_names:
+            if key not in seen_metrics:
+                seen_metrics.add(key)
+                return canonical_by_metric[key]
+        return None
+
     # process incoming criteria
     for item in criteria:
         lowered = item.lower()
         if any(phrase in lowered for phrase in UNSUPPORTED_PHRASES):
             continue
-        if any(name in lowered for name in allowed_names):
-            sanitized.append(item)
+
+        matched_metric = next((name for name in allowed_names if name in lowered), None)
+        if matched_metric:
+            if matched_metric in seen_metrics:
+                continue  # dedupe per metric
+            seen_metrics.add(matched_metric)
+            sanitized.append(canonical_by_metric[matched_metric])
         else:
-            if suggestions:
-                sanitized.append(suggestions.pop(0))
+            suggestion = next_suggestion()
+            if suggestion:
+                sanitized.append(suggestion)
 
     # backfill if empty or still need at least one per drill
-    if not sanitized and suggestions:
-        sanitized.append(suggestions.pop(0))
+    if not sanitized:
+        suggestion = next_suggestion()
+        if suggestion:
+            sanitized.append(suggestion)
 
     return sanitized
 
@@ -711,6 +806,11 @@ async def generate_coach_plan(request: CoachRequest) -> CoachResponse:
     mv_map = build_metric_value_map(request.metrics)
     system_prompt, user_prompt = build_prompt(request, disclaimer, mv_map)
     schema = CoachResponse.model_json_schema()
+    # Exclude rule-based recommendations from the LLM schema to avoid forcing the LLM to emit them.
+    if "properties" in schema:
+        schema["properties"].pop("rule_recommendations", None)
+    if "required" in schema:
+        schema["required"] = [r for r in schema["required"] if r != "rule_recommendations"]
 
     def attempt(prompt_text: str, attempt_num: int) -> CoachResponse:
         raw = call_llm(prompt_text, request.metrics, os.getenv("LLM_PROVIDER", "mock"), schema, attempt=attempt_num, system_prompt=system_prompt)
@@ -747,6 +847,12 @@ async def generate_coach_plan(request: CoachRequest) -> CoachResponse:
         # Ensure disclaimer override if we set one
         if disclaimer:
             resp.disclaimer = disclaimer
+        # Rule-based recommendations (non-LLM)
+        try:
+            resp.rule_recommendations = generate_rule_recommendations(request.metrics)
+        except Exception:
+            # Don't block the main response if rules fail; log and continue.
+            logger.exception("[COACH] rule_recommendations generation failed")
         # Normalize total_minutes to 10 if close
         if 9 <= resp.total_minutes <= 11:
             resp.total_minutes = 10
@@ -754,6 +860,9 @@ async def generate_coach_plan(request: CoachRequest) -> CoachResponse:
 
     try:
         return attempt(user_prompt, 1)
+    except HTTPException as http_exc:
+        # pass through standardized errors (e.g., LLM timeouts)
+        raise http_exc
     except Exception as first_exc:
         retry_prefix = (
             "Your last output failed validation.\n"
@@ -767,27 +876,68 @@ async def generate_coach_plan(request: CoachRequest) -> CoachResponse:
         retry_prompt = retry_prefix + user_prompt
         try:
             return attempt(retry_prompt, 2)
+        except HTTPException as http_exc:
+            raise http_exc
         except Exception as exc:
-            msg = str(exc)
+            import traceback
             traceback.print_exc()
-            log_coach_failure("exception_trace", "", None, {"trace": traceback.format_exc()})
-            if "primary issue" in msg:
-                detail = "Evidence does not support primary issue"
-                stage = "guardrail_relevance"
-            elif "metric/value pairs" in msg or "exactly" in msg:
-                detail = "LLM evidence did not cite metric-name/value pairs correctly"
-                stage = "guardrail_pairing"
-            elif "Success criteria" in msg:
-                detail = "Success criteria not logically improving metrics"
-                stage = "guardrail_targets"
-            elif "non-JSON" in msg:
-                detail = "LLM returned invalid output"
-                stage = "parse_json"
-            elif "Schema validation" in msg:
-                detail = "LLM returned invalid output"
-                stage = "schema_validation"
-            else:
-                detail = "LLM returned invalid output"
-                stage = "unknown"
-            log_coach_failure(stage, msg, None, {"attempt": 2, "max_attempts": 2})
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=detail) from exc
+            raise
+
+
+# --------- Minimal self-checks (dev only) --------- #
+
+def _test_sanitize_success_criteria() -> None:
+    metrics = {
+        "timing": {"timing_variance_ms": 200.0, "rushed_notes_percent": 12.0, "dragged_notes_percent": 8.0},
+        "dynamics": {"dynamic_range_db": 10.0, "volume_consistency_score": 0.7},
+        "trends": {"consistency_score": 0.65},
+    }
+    criteria = ["Reduce timing_variance_ms below 50.00 (currently 50.00)"]
+    out = sanitize_success_criteria(criteria, metrics)
+    assert out, "sanitized criteria should not be empty"
+    first = out[0]
+    assert "(currently 200.00)" in first, "current value should reflect real metric"
+    target_match = NUM_REGEX.findall(first)
+    assert target_match, "target should be present"
+    target_val = float(target_match[0])
+    assert 169.9 <= target_val <= 170.1, "target should reflect 15% improvement"
+
+
+def _test_validate_success_criteria_ignores_currently() -> None:
+    metrics = {
+        "timing": {"timing_variance_ms": 200.0, "rushed_notes_percent": 12.0, "dragged_notes_percent": 8.0},
+        "dynamics": {"dynamic_range_db": 10.0, "volume_consistency_score": 0.7},
+        "trends": {"consistency_score": 0.65},
+    }
+    crit = ["Reduce timing_variance_ms below 170.00 (currently 50.00)"]
+    drill = Drill(
+        name="test",
+        duration_min=1,
+        tempo_bpm=80,
+        instructions=["do thing"],
+        success_criteria=crit,
+    )
+    assert validate_success_criteria([drill], metrics) is True, "mismatched currently clause should be ignored"
+
+
+def _test_unsupported_metric_replaced() -> None:
+    metrics = {
+        "timing": {"timing_variance_ms": 200.0, "rushed_notes_percent": 12.0, "dragged_notes_percent": 8.0},
+        "dynamics": {"dynamic_range_db": 10.0, "volume_consistency_score": 0.7},
+        "trends": {"consistency_score": 0.65},
+    }
+    out = sanitize_success_criteria(["Lower fret buzz below 2"], metrics)
+    assert out, "sanitized criteria should backfill suggestion"
+    allowed_names = ["timing_variance_ms", "rushed_notes_percent", "dragged_notes_percent", "dynamic_range_db", "volume_consistency_score", "consistency_score"]
+    assert any(name in out[0] for name in allowed_names), "should replace unsupported text with allowed metric suggestion"
+
+
+def _run_self_tests() -> None:
+    _test_sanitize_success_criteria()
+    _test_validate_success_criteria_ignores_currently()
+    _test_unsupported_metric_replaced()
+    print("self-tests passed")
+
+
+if __name__ == "__main__":
+    _run_self_tests()

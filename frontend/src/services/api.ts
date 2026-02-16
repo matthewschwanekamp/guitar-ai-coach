@@ -1,4 +1,4 @@
-import { CoachResponse, Metrics } from "../types";
+import { ApiError, CoachResponse, Metrics, RuleRecommendation } from "../types";
 
 const BASE_URL = (
   (import.meta as any).env?.VITE_API_BASE_URL ||
@@ -7,20 +7,45 @@ const BASE_URL = (
 ).replace(/\/$/, "");
 
 async function handleResponse<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    let detail = await res.text();
-    try {
-      const json = JSON.parse(detail);
-      detail = json.detail || detail;
-    } catch {
-      // keep text
-    }
-    throw new Error(`HTTP ${res.status}: ${detail}`);
+  if (res.ok) {
+    return res.json() as Promise<T>;
   }
-  return res.json() as Promise<T>;
+
+  const rawText = await res.text();
+  let parsed: any = null;
+  try {
+    parsed = rawText ? JSON.parse(rawText) : null;
+  } catch {
+    // non-JSON body
+  }
+
+  const payload: ApiError | undefined =
+    parsed?.error_code
+      ? parsed
+      : parsed?.detail?.error_code
+      ? parsed.detail
+      : undefined;
+
+  if (payload) {
+    const err = new Error(payload.user_message || "Request failed");
+    (err as any).apiError = payload;
+    (err as any).status = res.status;
+    throw err;
+  }
+
+  if (parsed?.detail) {
+    throw new Error(`HTTP ${res.status}: ${parsed.detail}`);
+  }
+
+  throw new Error(`HTTP ${res.status}: ${rawText || "Request failed"}`);
 }
 
-export async function analyzeAudio(file: File): Promise<Metrics> {
+export interface AnalyzeResponse {
+  metrics: Metrics;
+  rule_recommendations: RuleRecommendation[];
+}
+
+export async function analyzeAudio(file: File): Promise<AnalyzeResponse> {
   const form = new FormData();
   form.append("file", file);
 
@@ -29,7 +54,7 @@ export async function analyzeAudio(file: File): Promise<Metrics> {
     body: form,
   });
 
-  return handleResponse<Metrics>(res);
+  return handleResponse<AnalyzeResponse>(res);
 }
 
 export async function generatePlan(payload: { metrics: Metrics; skill_level: string; goal: string }): Promise<CoachResponse> {
@@ -49,10 +74,5 @@ export async function coachFromMetrics(params: { metrics: any; skill_level: stri
     body: JSON.stringify(params),
   });
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Coach failed (${res.status}): ${text}`);
-  }
-
-  return res.json();
+  return handleResponse<any>(res);
 }
